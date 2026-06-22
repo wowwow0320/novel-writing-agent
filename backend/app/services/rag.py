@@ -9,7 +9,8 @@ from sqlalchemy.orm import selectinload
 from app.config import get_settings
 from app.models import Episode, EpisodeBody, EpisodeChunk, StoryBibleEntry
 from app.services import llm
-from app.services.episode_text import full_episode_writing_text
+from app.services.episode_text import full_episode_writing_text, split_paragraphs
+from app.services.event_map import match_paragraph_to_event
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +52,50 @@ async def embed_bible_entries(session: AsyncSession, rows: list[StoryBibleEntry]
     await session.flush()
 
 
+def _guess_chunk_category(para: str) -> str:
+    t = (para or "")[:500]
+    if any(q in t for q in ('"', "'", "「", "『", "말했다", "물었다", "대답", "말을")):
+        return "character"
+    if any(
+        k in t
+        for k in (
+            "그때",
+            "한편",
+            "동시에",
+            "하늘",
+            "바람",
+            "공기",
+            "조용",
+            "어둠",
+            "빛이",
+            "분위기",
+        )
+    ):
+        return "situation"
+    return "event"
+
+
+def _color_for_category(cat: str) -> str:
+    return {"character": "#2563eb", "situation": "#64748b", "event": "#16a34a"}.get(
+        (cat or "").lower(),
+        "#64748b",
+    )
+
+
 async def upsert_chunks_for_episode(
     session: AsyncSession,
     story_id: uuid.UUID,
     episode: Episode,
     chunk_size: int = 1200,
     overlap: int = 200,
+    events: list[dict[str, Any]] | None = None,
 ) -> None:
+    """본문을 세그먼트·단락 단위로 쪼개 임베딩한다(긴 단락은 chunk_size로 추가 분할).
+
+    events 가 주어지면 각 paragraph 를 가장 잘 설명하는 이벤트(parent_event_id/title)와
+    연결해 chunk_meta 에 저장한다(Parent-Child 기억 계층용).
+    """
+    del overlap  # 단락 우선 전략에서는 미사용(시그니처 호환)
     r = await session.execute(
         select(Episode).where(Episode.id == episode.id).options(selectinload(Episode.bodies))
     )
@@ -66,21 +104,68 @@ async def upsert_chunks_for_episode(
     body = full_episode_writing_text(ep).strip()
     if not body:
         return
-    chunks: list[str] = []
-    i = 0
-    while i < len(body):
-        chunks.append(body[i : i + chunk_size])
-        i += max(chunk_size - overlap, 1)
+
+    rows_to_embed: list[tuple[str, str, dict[str, Any]]] = []
+    for seg in sorted(ep.bodies or [], key=lambda x: x.segment_index):
+        paras = split_paragraphs(seg.content or "")
+        if not paras:
+            continue
+        for pi, para in enumerate(paras):
+            p = (para or "").strip()
+            if not p:
+                continue
+            cat = _guess_chunk_category(p)
+            color = _color_for_category(cat)
+            parent_event_id: str | None = None
+            parent_event_title: str | None = None
+            if events:
+                match = match_paragraph_to_event(p, events)
+                if match is not None:
+                    parent_event_id, parent_event_title = match
+            if len(p) <= chunk_size:
+                meta: dict[str, Any] = {
+                    "segment_index": seg.segment_index,
+                    "paragraph_index": pi,
+                    "color_tag": color,
+                }
+                if parent_event_id:
+                    meta["parent_event_id"] = parent_event_id
+                    meta["parent_event_title"] = parent_event_title
+                rows_to_embed.append((p, cat, meta))
+                continue
+            i = 0
+            sub = 0
+            while i < len(p):
+                part = p[i : i + chunk_size]
+                meta = {
+                    "segment_index": seg.segment_index,
+                    "paragraph_index": pi,
+                    "part_index": sub,
+                    "color_tag": color,
+                }
+                if parent_event_id:
+                    meta["parent_event_id"] = parent_event_id
+                    meta["parent_event_title"] = parent_event_title
+                rows_to_embed.append((part, cat, meta))
+                sub += 1
+                i += chunk_size
+
+    if not rows_to_embed:
+        return
+
     settings = get_settings()
+    texts = [x[0] for x in rows_to_embed]
     embeddings: list[list[float]] = []
     if settings.embedding_provider != "none":
-        embeddings = await llm.embed_texts(chunks)
-    for idx, c in enumerate(chunks):
+        embeddings = await llm.embed_texts(texts)
+    for idx, (content, cat, meta) in enumerate(rows_to_embed):
         row = EpisodeChunk(
             story_id=story_id,
             episode_id=episode.id,
             chunk_index=idx,
-            content=c,
+            content=content,
+            category=cat,
+            chunk_meta=meta,
         )
         if embeddings and idx < len(embeddings) and embeddings[idx]:
             row.embedding = embeddings[idx]

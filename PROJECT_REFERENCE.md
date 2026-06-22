@@ -98,8 +98,10 @@
 | `AI_PROVIDER` | `gemini` 또는 `openai`. |
 | `GEMINI_API_KEY`, `GEMINI_MODEL` | Gemini 사용 시. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | OpenAI 사용 시. |
-| `EMBEDDING_PROVIDER` | 기본 `ollama`(bge-m3) / `none` / `openai` / `gemini`. |
-| `EMBEDDING_DIMENSION` | **Alembic `001_initial.py`의 `EMBED_DIM=1024`(bge-m3)과 일치.** |
+| `EMBEDDING_PROVIDER` | 기본 `openai` / `none` / `gemini` / `ollama`(bge-m3). |
+| `OPENAI_EMBED_MODEL` | OpenAI 임베딩 모델명. 기본 `text-embedding-3-large` (`dimensions=EMBEDDING_DIMENSION`). |
+| `OPENAI_BIBLE_MODEL` | 바이블 JSON 추출 전용 채팅 모델. 기본 `gpt-5-nano` (`complete_chat_bible`). |
+| `EMBEDDING_DIMENSION` | **DB `vector(...)` 차원과 일치.** 마이그레이션 `004` 이후 기본 **3072** (OpenAI 3-large 전폭). |
 | `RAG_RECENT_FULL_EPISODES` | 슬라이딩 윈도우 최근 전문 에피소드 개수. |
 | `SUMMARY_MAX_CHARS` | 요약 프롬프트 힌트. |
 | `CORS_ALLOW_ORIGINS` | **쉼표 구분** 허용 Origin 문자열. Docker Nginx·로컬 Vite 등. |
@@ -113,7 +115,8 @@
 | `alembic.ini` | 로컬 기본 동기 URL: `postgresql+psycopg://novel:novel@localhost:5433/novel_agent` |
 | `alembic/env.py` | 환경변수 **`ALEMBIC_SYNC_URL`** 이 있으면 이를 `sqlalchemy.url` 로 사용(온라인/오프라인 모두). Docker·CI에서 `db:5432` 연결에 사용. |
 | `alembic/script.py.mako` | 새 리비전 파일 템플릿. |
-| `alembic/versions/001_initial.py` | `CREATE EXTENSION vector`, 테이블·ENUM·`Vector(1024)` 컬럼 생성. |
+| `alembic/versions/001_initial.py` | `CREATE EXTENSION vector`, 테이블·ENUM·초기 `Vector(1024)` 컬럼 생성. |
+| `alembic/versions/004_vector_3072_hierarchy_summaries.py` | 벡터 **3072** + `body_summary` / `chapter_events` / `work_summary` 컬럼. |
 
 **앱 런타임**은 `asyncpg` + `DATABASE_URL`, **마이그레이션**은 `psycopg`(동기)로 같은 DB에 접속합니다.
 
@@ -170,10 +173,15 @@
 
 | 메서드 | 경로 | 로직 요약 |
 |--------|------|-----------|
-| POST | `/api/agent/expand-draft` | 대상 `Episode` 로드 → `build_writer_context`로 시놉시스·바이블·직전 요약·슬라이딩 윈도우 문자열 조합 → 장르로 `genre_writer_role` → `expand_draft_*` 프롬프트 → `llm.complete_chat` → 본문 반환 (DB 자동 저장 없음). |
-| POST | `/api/agent/finalize-episode/{episode_id}` | `ai_content` 필수 → `summary_*` 프롬프트로 요약 생성 후 `Episode.summary` 저장 → `rag.upsert_chunks_for_episode`로 청크·임베딩(설정 시). |
+| POST | `/api/agent/expand-draft` | 대상 `Episode` 로드 → `build_writer_context`(시놉시스·바이블·그래프 컨텍스트·직전 요약·슬라이딩 윈도우) 조합 → 장르 `genre_writer_role` → `expand_draft_*` 프롬프트 → `llm.complete_chat` → 본문 반환 (DB 자동 저장 없음). |
+| POST | `/api/agent/finalize-episode/{episode_id}` | 본문 블록 기준 계층 요약(블록 요약·사건·챕터 요약) 저장 + `Story.work_summary` 롤업 + `rag.upsert_chunks_for_episode` + (옵션) Neo4j 동기화. |
 | POST | `/api/agent/bible-extract` | 본문으로 바이블 추출 프롬프트 → JSON 배열 파싱 → **DB에 쓰지 않고** `entries`만 반환. |
-| POST | `/api/agent/bible-apply/{episode_id}` | 해당 에피소드 `ai_content`로 동일 추출 → 파싱 항목마다 `StoryBibleEntry` **추가** (중복 병합 없음). |
+| POST | `/api/agent/bible-apply/{episode_id}` | 해당 에피소드 본문으로 추출 → 파싱 항목 `StoryBibleEntry` 추가 + 임베딩 + (옵션) Neo4j 엔티티 동기화. |
+| GET | `/api/agent/graph/ontology` | 그래프 온톨로지(노드/관계 타입) 반환. |
+| POST | `/api/agent/graph-sync/{episode_id}` | 선택 에피소드 본문에서 Neo4j 수동 동기화. |
+| GET | `/api/agent/graph/subgraph/{story_id}` | 3D 시각화용 그래프 노드/엣지 반환. |
+| GET | `/api/agent/graph/sync-check/{story_id}` | Postgres vs Graph 정합성 점검 카운트. |
+| POST | `/api/agent/harness/conflict-resolution` | Postgres/Graph 충돌 상태 해결 정책 하네스. |
 | POST | `/api/agent/bridge` | 선택적 `story_id`로 바이블 힌트 → A요약+B메모 브리지 프롬프트 → 제안 텍스트. |
 | POST | `/api/agent/rag-search` | `rag.search_similar` (임베딩 있으면 벡터, 없으면 ILIKE); 결과 없으면 `keyword_fallback_episodes`. |
 | POST | `/api/agent/consistency` | 최근 에피소드 본문 발췌 + 바이블 + 시놉시스 → 일관성 검토 프롬프트. |
@@ -184,7 +192,8 @@
 ### 3.13 `app/services/llm.py`
 
 - `complete_chat(system, user, temperature)`: `AI_PROVIDER`에 따라 OpenAI Chat Completions 비동기 또는 Gemini `GenerativeModel` + `generate_content_async`.
-- `embed_texts`: `ollama`는 `OLLAMA_EMBED_MODEL`(기본 bge-m3), `openai`는 `text-embedding-3-small`+`dimensions=EMBEDDING_DIMENSION`, `gemini`는 `text-embedding-004`(차원 불일치 시 런타임 오류).
+- `complete_chat_bible(...)`: 바이블/그래프 추출 전용 OpenAI 모델(`OPENAI_BIBLE_MODEL`, 기본 `gpt-5-nano`) 우선.
+- `embed_texts`: `ollama`는 `OLLAMA_EMBED_MODEL`(기본 bge-m3), `openai`는 `OPENAI_EMBED_MODEL`(기본 `text-embedding-3-large`)+`dimensions=EMBEDDING_DIMENSION`, `gemini`는 `text-embedding-004`(차원 불일치 시 런타임 오류).
 - `genre_writer_role(genre)`: 한글/영문 키워드로 역할 문자열 매핑 (로맨스·스릴러 등).
 
 ### 3.14 `app/services/prompts.py`
@@ -200,9 +209,9 @@
 
 - `load_story_episodes`: 스토리 + 에피소드 정렬 로드.
 - `fetch_bible`, `format_bible`: 바이블 목록 텍스트화.
-- `sliding_window_context`: 현재 챕터 **이전** 에피소드 중 최근 N개는 `ai_content` 우선 전문, 그보다 오래된 것은 `summary`만 나열.
+- `sliding_window_context`: 현재 챕터 **이전** 에피소드 중 최근 N개는 본문 합본(`episode_bodies`) 전문, 그보다 오래된 것은 `summary`만 나열.
 - `prev_chapter_summary`: `chapter_num - 1` 요약.
-- `build_writer_context`: 위를 묶어 에이전트 확장에 쓰는 dict 반환.
+- `build_writer_context`: 위 + Neo4j Graph-to-Text(`graph_block`)를 묶어 에이전트 확장 dict 반환.
 
 ### 3.16 `app/services/rag.py`
 

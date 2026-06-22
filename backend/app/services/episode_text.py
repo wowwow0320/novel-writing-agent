@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterable
+from typing import Any
 
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,23 +36,38 @@ def full_episode_writing_text(ep: Episode) -> str:
     return ""
 
 
+def split_paragraphs(text: str) -> list[str]:
+    parts = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    if parts:
+        return parts
+    single = (text or "").strip()
+    return [single] if single else []
+
+
 async def replace_episode_bodies(
     session: AsyncSession,
     episode: Episode,
-    items: list[tuple[str | None, str, BodySegmentLink | None]],
+    items: list[tuple[str | None, str, BodySegmentLink | None, str | None, dict[str, Any] | None]],
 ) -> None:
-    """items: (title, content, link_to_previous) 순서가 segment_index가 된다. 첫 항목의 link는 무시되어 None으로 저장."""
+    """items: (title, content, link_to_previous, body_summary, meta_tags). segment_index는 배열 순서."""
     await session.execute(delete(EpisodeBody).where(EpisodeBody.episode_id == episode.id))
-    for pos, (title, content, link) in enumerate(items):
+    for pos, row in enumerate(items):
+        title, content, link = row[0], row[1], row[2]
+        body_summary = row[3] if len(row) > 3 else None
+        meta_tags = row[4] if len(row) > 4 else None
         link_val = None if pos == 0 else (link or BodySegmentLink.continuous)
-        row = EpisodeBody(
+        bs = (body_summary or "").strip() or None
+        mt = meta_tags if isinstance(meta_tags, dict) else None
+        erow = EpisodeBody(
             id=uuid.uuid4(),
             story_id=episode.story_id,
             episode_id=episode.id,
             segment_index=pos,
             title=(title or None) if title else None,
             content=content or "",
+            body_summary=bs,
             link_to_previous=link_val,
+            meta_tags=mt,
         )
-        session.add(row)
+        session.add(erow)
     await session.flush()

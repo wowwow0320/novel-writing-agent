@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models import Episode, Story
 from app.schemas import EpisodeCreate, EpisodeOut, EpisodeUpdate, ReplaceEpisodeBodiesRequest
 from app.services.episode_text import replace_episode_bodies
+from app.services.summary_tree import mark_summary_tree_stale
 
 router = APIRouter(prefix="/stories/{story_id}/episodes", tags=["episodes"])
 
@@ -45,7 +46,7 @@ async def create_episode(
     db.add(e)
     await db.flush()
     first_text = body.ai_content if body.ai_content is not None else ""
-    await replace_episode_bodies(db, e, [(None, first_text, None)])
+    await replace_episode_bodies(db, e, [(None, first_text, None, None, None)])
     await db.commit()
     out = await _load_episode(db, story_id, e.id)
     assert out is not None
@@ -90,8 +91,11 @@ async def replace_bodies(
     e = await _load_episode(db, story_id, episode_id)
     if not e:
         raise HTTPException(404, "episode not found")
-    tuples = [(b.title, b.content, b.link_to_previous) for b in body.bodies]
+    tuples = [
+        (b.title, b.content, b.link_to_previous, b.body_summary, b.meta_tags) for b in body.bodies
+    ]
     await replace_episode_bodies(db, e, tuples)
+    await mark_summary_tree_stale(db, story_id, episode_id=episode_id, chapter_num=e.chapter_num)
     await db.commit()
     out = await _load_episode(db, story_id, episode_id)
     assert out is not None
@@ -111,6 +115,8 @@ async def update_episode(
     data = body.model_dump(exclude_unset=True)
     for k, v in data.items():
         setattr(e, k, v)
+    if {"raw_memory", "summary", "chapter_events", "meta_tags"} & set(data.keys()):
+        await mark_summary_tree_stale(db, story_id, episode_id=episode_id, chapter_num=e.chapter_num)
     await db.commit()
     out = await _load_episode(db, story_id, episode_id)
     assert out is not None
